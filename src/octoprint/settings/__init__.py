@@ -190,6 +190,31 @@ class HierarchicalChainMap:
         return dict(items)
 
     @staticmethod
+    def _flattenWithNesting(d: dict, parent_key: str = "") -> dict:
+        """Flattens a hierarchical dictionary but preserve nestings hierarchy for easier access."""
+
+        if d is None:
+            return {}
+
+        nestings = {}
+
+        items = []
+        for k, v in d.items():
+            if not v or not isinstance(v, dict):
+                items.append((k, v))
+            else:
+                new_key = parent_key + _CHAINMAP_SEP + str(k) if parent_key else str(k)
+
+                new_nestings = HierarchicalChainMap._flattenWithNesting(v, new_key)
+
+                nestings.update(new_nestings)
+
+        if len(items):
+            nestings[parent_key] = dict(items);
+
+        return nestings
+
+    @staticmethod
     def _unflatten(d: dict, prefix: str = "") -> dict:
         """Unflattens a flattened dictionary."""
 
@@ -235,10 +260,17 @@ class HierarchicalChainMap:
     def from_layers(*layers):
         result = HierarchicalChainMap()
         result._chainmap.maps = layers
+
+        for layer in layers:
+            unflattened = HierarchicalChainMap._unflatten(layer)
+
+            result._nestedChainmaps.maps.append(HierarchicalChainMap._flattenWithNesting(unflattened))
+
         return result
 
     def __init__(self, *maps):
         self._chainmap = ChainMap(*map(self._flatten, maps))
+        self._nestedChainmaps = ChainMap(*map(self._flattenWithNesting, maps))
 
     def deep_dict(self):
         return self._unflatten(self._chainmap)
@@ -258,10 +290,13 @@ class HierarchicalChainMap:
     def get_by_path(self, path, only_local=False, only_defaults=False, merged=False):
         if only_defaults:
             current = self._chainmap.parents
+            currentNested = self._nestedChainmaps.parents
         elif only_local:
             current = self._chainmap.maps[0]
+            currentNested = self._nestedChainmaps.maps[0]
         else:
             current = self._chainmap
+            currentNested = self._nestedChainmaps
 
         key = self._path_to_key(path)
         prefix = key + _CHAINMAP_SEP
@@ -282,15 +317,19 @@ class HierarchicalChainMap:
                     current = layer
                     break
 
+        elements = {k: v for k, v in current.items() if k.startswith(prefix)}
+
         result = self._unflatten(
-            {k: v for k, v in current.items() if k.startswith(prefix)}, prefix=prefix
+            elements, prefix=prefix
         )
+
         if not result:
             raise KeyError("Could not find entry for " + str(path))
         return result
 
     def set_by_path(self, path, value):
         current = self._chainmap.maps[0]  # config only
+        currentNested = self._nestedChainmaps.maps[0]
         key = self._path_to_key(path)
 
         # delete any subkeys
@@ -298,26 +337,54 @@ class HierarchicalChainMap:
 
         if isinstance(value, dict):
             current.update(self._flatten(value, key))
+            currentNested.update(self._flattenWithNesting(value, key))
         else:
             # make sure to clear anything below the path (e.g. switching from dict
             # to something else, for whatever reason)
             self._clean_upward_path(current, path)
             current[key] = value
 
+            parent_key = self._path_to_key(path[:-1])
+
+            currentNested[parent_key][path[-1]] = value
+
+            to_delete = []
+
+            for k, v in currentNested.items():
+                if k.startswith(key):
+                    to_delete.append(k)
+
+            for k in to_delete:
+                del currentNested[k]
+
     def del_by_path(self, path):
         if not path:
             raise ValueError("Invalid path")
 
         current = self._chainmap.maps[0]  # config only
+        currentNested = self._nestedChainmaps.maps[0]
         delete_key = self._path_to_key(path)
         deleted = False
 
         # delete any subkeys
         deleted = self._del_prefix(current, delete_key)
 
+        to_delete = []
+
+        for k, v in currentNested.items():
+            if k.startswith(delete_key):
+                to_delete.append(k)
+
+        for k in to_delete:
+            del currentNested[k]
+
         # delete the key itself if it's there
         try:
             del current[delete_key]
+
+            parent_key = self._path_to_key(path[:-1])
+            del currentNested[parent_key][path[-1]]
+
             deleted = True
         except KeyError:
             pass
@@ -390,6 +457,7 @@ class HierarchicalChainMap:
     @top_map.setter
     def top_map(self, value):
         self._chainmap.maps[0] = self._flatten(value)
+        self._nestedChainmaps.maps[0] = self._flattenWithNesting(value)
 
     @property
     def bottom_map(self):
@@ -398,9 +466,11 @@ class HierarchicalChainMap:
 
     def insert_map(self, pos, d):
         self._chainmap.maps.insert(pos, self._flatten(d))
+        self._nestedChainmaps.maps.insert(pos, self._flattenWithNesting(d))
 
     def delete_map(self, pos):
         del self._chainmap.maps[pos]
+        del self._nestedChainmaps.maps[pos]
 
     @property
     def all_layers(self):
